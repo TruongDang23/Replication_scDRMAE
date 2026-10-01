@@ -4,9 +4,14 @@ Reimplements the training loop from main_clustering.ipynb (5-fold CV,
 masked-reconstruction + KL loss, KMeans clustering, NMI/ARI/AMI reporting)
 for data that is already in AnnData/h5ad form instead of the CSV/mtx format
 that read_dataset1() in the notebook expects.
+
+After CV, writes {method}_{dataset}.npz (see export.py / EXPORT_NPZ_GUIDE.md):
+the model of one fold encodes ALL cells and KMeans clusters them. Disable
+with --no-export.
 """
 
 import argparse
+import os
 import random
 
 import numpy as np
@@ -14,10 +19,12 @@ import scanpy as sc
 import scipy.sparse as sp
 import torch
 from sklearn.cluster import KMeans
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from sklearn.model_selection import KFold
 
 from datasets import apply_noise
 from evaluate import evaluate
+from export import save_embedding
 from model import scDRMAE
 from util import AverageMeter
 
@@ -112,6 +119,61 @@ def inference(net, loader, device):
     return np.array(feats), np.array(labs)
 
 
+def encode_all(net, x_rna, x_atac, device, batch_size):
+    """Encode every cell in original row order, in batches of `batch_size`
+    (same batching as data_loader_all in the notebook).
+
+    Slices the arrays directly instead of iterating a DataLoader: a DataLoader
+    draws from the global torch RNG even with shuffle=False, which would shift
+    the random stream of the folds that follow.
+    """
+    net.eval()
+    feats = []
+    with torch.no_grad():
+        for s in range(0, len(x_rna), batch_size):
+            x = torch.from_numpy(x_rna[s:s + batch_size]).float().to(device)
+            x1 = torch.from_numpy(x_atac[s:s + batch_size]).float().to(device)
+            feats.append(net.feature(x, x1).cpu().numpy())
+    return np.concatenate(feats)
+
+
+def pick_export_fold(aris, export_fold):
+    if export_fold is not None:
+        return export_fold, "user"
+    aris = np.asarray(aris)
+    return int(np.argmin(np.abs(aris - np.median(aris)))), "closest_to_median_test_ari"
+
+
+def export_npz(args, rna, label_key, n_classes, fold_latents, aris, nmis):
+    fold, selection = pick_export_fold(aris, args.export_fold)
+    emb = fold_latents[fold]
+    # Same clustering call as the per-fold test step, applied to all cells.
+    y_pred = KMeans(n_clusters=n_classes).fit_predict(emb)
+    y_true = rna.obs[label_key].astype(str).to_numpy()
+    if label_key != "Group":
+        print(f"[export][WARN] y_true is taken from obs['{label_key}'], the guide expects obs['Group'] "
+              "- pass --label-key Group if that column exists.")
+
+    os.makedirs(args.export_dir, exist_ok=True)
+    save_embedding(
+        out_path=os.path.join(args.export_dir, f"{args.method_name}_{args.dataset}.npz"),
+        emb=emb,
+        cell_ids=rna.obs_names.to_numpy().astype(str),
+        y_true=y_true,
+        y_pred=y_pred,
+        method=args.method_name,
+        ari=adjusted_rand_score(y_true, y_pred),
+        nmi=normalized_mutual_info_score(y_true, y_pred),
+        emb_source=f"model.feature (h00) of fold {fold} on all cells, batch_size={args.batch_size}",
+        fold=fold,
+        fold_selection=selection,
+        fold_test_ari=aris[fold],
+        fold_test_nmi=nmis[fold],
+        cv_mean_ari=np.mean(aris),
+        cv_mean_nmi=np.mean(nmis),
+    )
+
+
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--rna", default="data/SNARE/RNA.h5ad")
@@ -128,7 +190,19 @@ def get_args():
         action="store_true",
         help="Actually run TF-IDF on the ATAC modality (see NOTE in preprocess_modality).",
     )
-    return p.parse_args()
+    p.add_argument("--no-export", action="store_true", help="Skip writing the .npz after training.")
+    p.add_argument("--export-dir", default="output")
+    p.add_argument("--method-name", default="scDRMAE", help="Method name in the .npz and its filename.")
+    p.add_argument(
+        "--export-fold",
+        type=int,
+        default=None,
+        help="Fold whose model encodes all cells for the .npz (default: fold with test ARI closest to the median).",
+    )
+    args = p.parse_args()
+    if args.export_fold is not None and not 0 <= args.export_fold < args.folds:
+        p.error(f"--export-fold must be in [0, {args.folds - 1}]")
+    return args
 
 
 def main():
@@ -144,6 +218,9 @@ def main():
     atac = sc.read_h5ad(args.atac)
     if rna.n_obs != atac.n_obs:
         raise ValueError(f"RNA has {rna.n_obs} cells but ATAC has {atac.n_obs}; expected paired cells.")
+    if not rna.obs_names.equals(atac.obs_names):
+        print("[WARN] RNA and ATAC obs_names differ (order or format); cells are paired by row "
+              "position and the .npz uses RNA barcodes.")
 
     label_key = find_label_key(rna, args.label_key)
     classes, labels = np.unique(rna.obs[label_key].values, return_inverse=True)
@@ -159,6 +236,7 @@ def main():
 
     kf = KFold(n_splits=args.folds, shuffle=True, random_state=42)
     nmis, aris, amis = [], [], []
+    fold_latents = {}  # fold -> (N, d) latent of all cells, for the .npz export
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(x_rna_all)):
         x_rna_train = torch.from_numpy(x_rna_all[train_idx])
@@ -220,8 +298,15 @@ def main():
         aris.append(ari)
         amis.append(ami)
 
+        if not args.no_export and args.export_fold in (None, fold):
+            # Same weights that produced this fold's test result.
+            fold_latents[fold] = encode_all(model, x_rna_all, x_atac_all, device, args.batch_size)
+
     print("=" * 60)
     print(f"Mean over {args.folds} folds: NMI={np.mean(nmis):.4f} ARI={np.mean(aris):.4f} AMI={np.mean(amis):.4f}")
+
+    if not args.no_export:
+        export_npz(args, rna, label_key, n_classes, fold_latents, aris, nmis)
 
 
 if __name__ == "__main__":
