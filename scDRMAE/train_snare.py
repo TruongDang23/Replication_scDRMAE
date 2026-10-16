@@ -8,9 +8,16 @@ that read_dataset1() in the notebook expects.
 After CV, writes {method}_{dataset}.npz (see export.py / EXPORT_NPZ_GUIDE.md):
 the model of one fold encodes ALL cells and KMeans clusters them. Disable
 with --no-export.
+
+Multi-seed: --seeds 10 20 30 runs the whole k-fold CV once per seed. Each run
+is re-seeded from scratch, so seed s gives the same numbers as `--seed s`.
+Model, hyperparameters and the fold split (KFold random_state=42) are the same
+for every seed; only the torch/numpy/random RNG changes. Reports mean ± std of
+the per-seed fold means and writes per-fold / per-seed CSVs.
 """
 
 import argparse
+import csv
 import os
 import random
 
@@ -37,6 +44,8 @@ DATASET_HPARAMS = {
     "10x": {"epochs": 20, "learning_rate": 0.002},
 }
 DEFAULT_HPARAMS = {"epochs": 100, "learning_rate": 0.002}  # the notebook's "else" branch
+
+METRICS = ("nmi", "ari", "ami", "acc")
 
 
 def setup_seed(seed):
@@ -144,18 +153,26 @@ def pick_export_fold(aris, export_fold):
     return int(np.argmin(np.abs(aris - np.median(aris)))), "closest_to_median_test_ari"
 
 
-def export_npz(args, rna, label_key, n_classes, fold_latents, aris, nmis):
+def pick_export_seed(seeds, seed_mean_aris, export_seed):
+    if export_seed is not None:
+        return export_seed, "user"
+    i, _ = pick_export_fold(seed_mean_aris, None)
+    return seeds[i], "closest_to_median_cv_mean_ari"
+
+
+def build_export(args, rna, label_key, n_classes, fold_latents, aris, nmis):
+    """save_embedding() kwargs for one seed's CV run.
+
+    Called right after that seed's folds, i.e. at the same point of the RNG
+    stream as a standalone `--seed s` run, so the KMeans below gives the same
+    y_pred whichever seed ends up exported.
+    """
     fold, selection = pick_export_fold(aris, args.export_fold)
     emb = fold_latents[fold]
     # Same clustering call as the per-fold test step, applied to all cells.
     y_pred = KMeans(n_clusters=n_classes).fit_predict(emb)
     y_true = rna.obs[label_key].astype(str).to_numpy()
-    if label_key != "Group":
-        print(f"[export][WARN] y_true is taken from obs['{label_key}'], the guide expects obs['Group'] "
-              "- pass --label-key Group if that column exists.")
-
-    os.makedirs(args.export_dir, exist_ok=True)
-    save_embedding(
+    return dict(
         out_path=os.path.join(args.export_dir, f"{args.method_name}_{args.dataset}.npz"),
         emb=emb,
         cell_ids=rna.obs_names.to_numpy().astype(str),
@@ -174,6 +191,33 @@ def export_npz(args, rna, label_key, n_classes, fold_latents, aris, nmis):
     )
 
 
+def per_seed_means(rows, seeds):
+    """{metric: array of fold means, one entry per seed in `seeds` order}."""
+    return {m: np.array([np.mean([r[m] for r in rows if r["seed"] == s]) for s in seeds]) for m in METRICS}
+
+
+def write_csv(path, rows):
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+
+
+def write_results(args, rows, per_seed):
+    out_dir = args.results_dir or args.export_dir
+    os.makedirs(out_dir, exist_ok=True)
+    prefix = os.path.join(out_dir, f"{args.method_name}_{args.dataset}")
+
+    write_csv(f"{prefix}_cv_folds.csv", rows)
+
+    summary = [{"seed": s, **{m: per_seed[m][i] for m in METRICS}} for i, s in enumerate(args.seeds)]
+    summary.append({"seed": "mean", **{m: per_seed[m].mean() for m in METRICS}})
+    if len(args.seeds) > 1:
+        summary.append({"seed": "std", **{m: per_seed[m].std(ddof=1) for m in METRICS}})
+    write_csv(f"{prefix}_cv_seeds.csv", summary)
+    print(f"[results] {prefix}_cv_folds.csv  {prefix}_cv_seeds.csv")
+
+
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--rna", default="data/SNARE/RNA.h5ad")
@@ -182,7 +226,21 @@ def get_args():
     p.add_argument("--dataset", default="SNARE")
     p.add_argument("--n-top-genes", type=int, default=3000)
     p.add_argument("--folds", type=int, default=5)
-    p.add_argument("--seed", type=int, default=10)
+    p.add_argument("--seed", type=int, default=10, help="Seed of a single run (ignored when --seeds is given).")
+    p.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Run the full k-fold CV once per seed and report mean ± std across seeds, e.g. --seeds 10 20 30 40 50.",
+    )
+    p.add_argument(
+        "--export-seed",
+        type=int,
+        default=None,
+        help="With --seeds: seed whose run is written to the .npz (default: seed with CV-mean ARI closest to the median).",
+    )
+    p.add_argument("--results-dir", default=None, help="Where to write the per-fold/per-seed CSVs (default: --export-dir).")
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     p.add_argument(
@@ -202,40 +260,22 @@ def get_args():
     args = p.parse_args()
     if args.export_fold is not None and not 0 <= args.export_fold < args.folds:
         p.error(f"--export-fold must be in [0, {args.folds - 1}]")
+    if args.seeds is not None and len(set(args.seeds)) != len(args.seeds):
+        p.error("--seeds must be distinct")
+    args.seeds = args.seeds or [args.seed]
+    if args.export_seed is not None and args.export_seed not in args.seeds:
+        p.error(f"--export-seed must be one of --seeds {args.seeds}")
     return args
 
 
-def main():
-    args = get_args()
-    setup_seed(args.seed)
-    device = torch.device(args.device)
+def run_cv(args, seed, x_rna_all, x_atac_all, labels, n_classes, device, epochs, lr):
+    """One full k-fold CV run with `seed`: exactly what a single-seed run does.
 
-    hp = DATASET_HPARAMS.get(args.dataset, DEFAULT_HPARAMS)
-    epochs, lr = hp["epochs"], hp["learning_rate"]
-    print(f"dataset={args.dataset} epochs={epochs} lr={lr} device={device}")
-
-    rna = sc.read_h5ad(args.rna)
-    atac = sc.read_h5ad(args.atac)
-    if rna.n_obs != atac.n_obs:
-        raise ValueError(f"RNA has {rna.n_obs} cells but ATAC has {atac.n_obs}; expected paired cells.")
-    if not rna.obs_names.equals(atac.obs_names):
-        print("[WARN] RNA and ATAC obs_names differ (order or format); cells are paired by row "
-              "position and the .npz uses RNA barcodes.")
-
-    label_key = find_label_key(rna, args.label_key)
-    classes, labels = np.unique(rna.obs[label_key].values, return_inverse=True)
-    n_classes = len(classes)
-    print(f"label_key={label_key} n_classes={n_classes}")
-
-    x_rna = preprocess_modality(rna, args.n_top_genes, "RNA", False)
-    x_atac = preprocess_modality(atac, args.n_top_genes, "ATAC", args.apply_atac_tfidf)
-
-    x_rna_all = to_dense(x_rna.X).astype(np.float32)
-    x_atac_all = to_dense(x_atac.X).astype(np.float32)
-    print(f"RNA features={x_rna_all.shape[1]} ATAC features={x_atac_all.shape[1]}")
-
+    Re-seeding here makes every seed's run independent of the seeds run before it.
+    """
+    setup_seed(seed)
     kf = KFold(n_splits=args.folds, shuffle=True, random_state=42)
-    nmis, aris, amis = [], [], []
+    rows = []  # one dict per fold
     fold_latents = {}  # fold -> (N, d) latent of all cells, for the .npz export
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(x_rna_all)):
@@ -286,27 +326,92 @@ def main():
             if ari > best_ari:
                 best_ari, best_epoch, best_state = ari, epoch, model.state_dict()
 
-        print(f"[fold {fold}] best_epoch={best_epoch} best_train_ari={best_ari:.4f}")
+        print(f"[seed {seed}][fold {fold}] best_epoch={best_epoch} best_train_ari={best_ari:.4f}")
         model.load_state_dict(best_state)
         model.eval()
         latent, true_label = inference(model, test_loader, device)
         pred_label = KMeans(n_clusters=n_classes).fit_predict(latent)
         nmi, ari, acc, ami = evaluate(true_label, pred_label)
-        print(f"[fold {fold}] test: NMI={nmi:.4f} ARI={ari:.4f} AMI={ami:.4f}")
+        print(f"[seed {seed}][fold {fold}] test: NMI={nmi:.4f} ARI={ari:.4f} AMI={ami:.4f}")
 
-        nmis.append(nmi)
-        aris.append(ari)
-        amis.append(ami)
+        rows.append(dict(seed=seed, fold=fold, best_epoch=best_epoch, nmi=nmi, ari=ari, ami=ami, acc=acc))
 
         if not args.no_export and args.export_fold in (None, fold):
             # Same weights that produced this fold's test result.
             fold_latents[fold] = encode_all(model, x_rna_all, x_atac_all, device, args.batch_size)
 
-    print("=" * 60)
-    print(f"Mean over {args.folds} folds: NMI={np.mean(nmis):.4f} ARI={np.mean(aris):.4f} AMI={np.mean(amis):.4f}")
+    return rows, fold_latents
+
+
+def main():
+    args = get_args()
+    device = torch.device(args.device)
+
+    hp = DATASET_HPARAMS.get(args.dataset, DEFAULT_HPARAMS)
+    epochs, lr = hp["epochs"], hp["learning_rate"]
+    print(f"dataset={args.dataset} epochs={epochs} lr={lr} device={device}")
+
+    rna = sc.read_h5ad(args.rna)
+    atac = sc.read_h5ad(args.atac)
+    if rna.n_obs != atac.n_obs:
+        raise ValueError(f"RNA has {rna.n_obs} cells but ATAC has {atac.n_obs}; expected paired cells.")
+    if not rna.obs_names.equals(atac.obs_names):
+        print("[WARN] RNA and ATAC obs_names differ (order or format); cells are paired by row "
+              "position and the .npz uses RNA barcodes.")
+
+    label_key = find_label_key(rna, args.label_key)
+    classes, labels = np.unique(rna.obs[label_key].values, return_inverse=True)
+    n_classes = len(classes)
+    print(f"label_key={label_key} n_classes={n_classes}")
+
+    x_rna = preprocess_modality(rna, args.n_top_genes, "RNA", False)
+    x_atac = preprocess_modality(atac, args.n_top_genes, "ATAC", args.apply_atac_tfidf)
+
+    x_rna_all = to_dense(x_rna.X).astype(np.float32)
+    x_atac_all = to_dense(x_atac.X).astype(np.float32)
+    print(f"RNA features={x_rna_all.shape[1]} ATAC features={x_atac_all.shape[1]}")
+    print(f"seeds={args.seeds}")
+
+    rows = []  # one dict per (seed, fold)
+    exports = {}  # seed -> save_embedding() kwargs
+    for seed in args.seeds:
+        seed_rows, fold_latents = run_cv(args, seed, x_rna_all, x_atac_all, labels, n_classes, device, epochs, lr)
+        rows.extend(seed_rows)
+        nmis = [r["nmi"] for r in seed_rows]
+        aris = [r["ari"] for r in seed_rows]
+        amis = [r["ami"] for r in seed_rows]
+        print("=" * 60)
+        print(f"[seed {seed}] Mean over {args.folds} folds: "
+              f"NMI={np.mean(nmis):.4f} ARI={np.mean(aris):.4f} AMI={np.mean(amis):.4f}")
+        if not args.no_export:
+            exports[seed] = build_export(args, rna, label_key, n_classes, fold_latents, aris, nmis)
+
+    per_seed = per_seed_means(rows, args.seeds)
+    if len(args.seeds) > 1:
+        print("=" * 60)
+        print(f"Mean ± std over {len(args.seeds)} seeds {args.seeds} (each seed = mean over {args.folds} folds):")
+        print("  " + "  ".join(f"{m.upper()}={per_seed[m].mean():.4f}±{per_seed[m].std(ddof=1):.4f}"
+                               for m in ("nmi", "ari", "ami")))
+    write_results(args, rows, per_seed)
 
     if not args.no_export:
-        export_npz(args, rna, label_key, n_classes, fold_latents, aris, nmis)
+        export_seed, seed_selection = pick_export_seed(args.seeds, per_seed["ari"], args.export_seed)
+        extra = {}
+        if len(args.seeds) > 1:
+            extra = dict(
+                seed=export_seed,
+                seed_selection=seed_selection,
+                seeds=np.array(args.seeds),
+                multi_seed_mean_ari=per_seed["ari"].mean(),
+                multi_seed_std_ari=per_seed["ari"].std(ddof=1),
+                multi_seed_mean_nmi=per_seed["nmi"].mean(),
+                multi_seed_std_nmi=per_seed["nmi"].std(ddof=1),
+            )
+        if label_key != "Group":
+            print(f"[export][WARN] y_true is taken from obs['{label_key}'], the guide expects obs['Group'] "
+                  "- pass --label-key Group if that column exists.")
+        os.makedirs(args.export_dir, exist_ok=True)
+        save_embedding(**exports[export_seed], **extra)
 
 
 if __name__ == "__main__":
